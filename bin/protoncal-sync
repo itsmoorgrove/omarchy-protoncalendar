@@ -3,9 +3,11 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from datetime import date, datetime, timedelta
 
 CONFIG_DIR = os.path.expanduser("~/.config/omarchy/protoncalendar")
@@ -23,6 +25,30 @@ PALETTE = [
 
 FETCH_TIMEOUT = 20
 MAX_FEED_BYTES = 32 * 1024 * 1024
+EXPANSION_TIMEOUT_SEC = 6
+MAX_EVENTS_PER_FEED = 3000
+MAX_EVENTS_TOTAL = 10000
+
+
+class ExpansionTimeout(Exception):
+    pass
+
+
+def _expansion_alarm(signum, frame):
+    raise ExpansionTimeout(f"recurrence expansion exceeded {EXPANSION_TIMEOUT_SEC}s")
+
+
+def expand_bounded(query, window_start, window_end):
+    previous = signal.signal(signal.SIGALRM, _expansion_alarm)
+    signal.alarm(EXPANSION_TIMEOUT_SEC)
+    try:
+        occurrences = query.between(window_start, window_end)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+    truncated = len(occurrences) > MAX_EVENTS_PER_FEED
+    return occurrences[:MAX_EVENTS_PER_FEED], truncated
 
 
 def feeds_path(override):
@@ -90,9 +116,13 @@ def cache_file(url):
 
 def fetch(url):
     path = cache_file(url)
+    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    if scheme not in ("http", "https"):
+        return read_cache(path, f"unsupported URL scheme: {scheme or '(none)'}")
     try:
         result = subprocess.run(
-            ["curl", "-sfL", "--max-time", str(FETCH_TIMEOUT),
+            ["curl", "-sfL", "--proto", "=http,https", "--proto-redir", "=http,https",
+             "--max-time", str(FETCH_TIMEOUT),
              "--max-filesize", str(MAX_FEED_BYTES), url],
             capture_output=True, timeout=FETCH_TIMEOUT + 10,
         )
@@ -178,8 +208,12 @@ def expand(text, feed, window_start, window_end, tz):
     calendar = icalendar.Calendar.from_ical(text)
     name = plain_text(feed["name"]) or text_of(calendar, "X-WR-CALNAME") or "Proton"
 
+    occurrences, truncated = expand_bounded(
+        recurring_ical_events.of(calendar), window_start, window_end
+    )
+
     events = []
-    for component in recurring_ical_events.of(calendar).between(window_start, window_end):
+    for component in occurrences:
         start = component.get("DTSTART")
         if start is None:
             continue
@@ -208,7 +242,7 @@ def expand(text, feed, window_start, window_end, tz):
             "calendar": name,
             "color": feed["color"],
         })
-    return events, name
+    return events, name, truncated
 
 
 def dedupe(events):
@@ -248,7 +282,10 @@ def sync(path, back_months, forward_months):
             continue
 
         try:
-            feed_events, resolved = expand(text, feed, window_start, window_end, tz)
+            feed_events, resolved, truncated = expand(text, feed, window_start, window_end, tz)
+        except ExpansionTimeout as exc:
+            report.append({**feed_summary(feed), "ok": False, "error": plain_text(str(exc))})
+            continue
         except Exception as exc:
             report.append({**feed_summary(feed), "ok": False, "error": plain_text(f"parse failed: {exc}")})
             continue
@@ -261,7 +298,12 @@ def sync(path, back_months, forward_months):
             "error": error,
             "stale": from_cache,
             "count": len(feed_events),
+            "truncated": truncated,
         })
+
+    if len(events) > MAX_EVENTS_TOTAL:
+        events.sort(key=lambda e: e["start"])
+        events = events[:MAX_EVENTS_TOTAL]
 
     return {
         "generatedAt": iso(now),

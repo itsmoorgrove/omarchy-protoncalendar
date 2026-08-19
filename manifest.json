@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.itsmoorgrove.protoncalendar",
   "name": "Proton Calendar",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": "moorgrove",
   "license": "MIT",
   "description": "Proton Calendar in the Omarchy bar: next event, month grid, and week grid.",

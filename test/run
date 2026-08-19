@@ -5,17 +5,30 @@
 # with its exclusive end, a multi-day span, an event over midnight, a UTC
 # stamp, a weekly rule, and a daily rule crossing the autumn DST change).
 #
+# Fixtures are served over a local HTTP server rather than file:// -- the
+# backend only fetches http/https, and the tests should exercise that same
+# path rather than a special case for themselves.
+#
 # Fixed TZ, so the DST assertions mean the same thing on any machine.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 root=$(cd .. && pwd)
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+
+port=$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()")
+python3 -m http.server "$port" --bind 127.0.0.1 --directory "$PWD" >/dev/null 2>&1 &
+server_pid=$!
+trap 'kill "$server_pid" 2>/dev/null; wait "$server_pid" 2>/dev/null || true; rm -rf "$work"' EXIT
+
+for _ in $(seq 1 50); do
+  curl -sf "http://127.0.0.1:$port/fixture.ics" >/dev/null 2>&1 && break
+  sleep 0.1
+done
 
 export TZ=Europe/Stockholm
 
-printf '[{"name": "", "url": "file://%s/fixture.ics"}]\n' "$PWD" > "$work/feeds.json"
+printf '[{"name": "", "url": "http://127.0.0.1:%s/fixture.ics"}]\n' "$port" > "$work/feeds.json"
 
 echo "== backend"
 "$root/bin/protoncal-sync" --feeds "$work/feeds.json" > "$work/payload.json"
@@ -30,3 +43,28 @@ print('   feeds:', len(payload['feeds']), ' events:', len(payload['events']))
 
 echo "== model"
 node model-test.js "$work/payload.json"
+
+echo "== hostile feed (unbounded RRULE must not hang or exhaust memory)"
+printf '[{"name": "", "url": "http://127.0.0.1:%s/hostile.ics"}]\n' "$port" > "$work/hostile-feeds.json"
+start=$(date +%s)
+"$root/bin/protoncal-sync" --feeds "$work/hostile-feeds.json" > "$work/hostile-payload.json"
+elapsed=$(( $(date +%s) - start ))
+python3 -c "
+import json
+payload = json.load(open('$work/hostile-payload.json'))
+assert not payload['ok'], 'a runaway RRULE must not report ok'
+assert 'exceeded' in payload['feeds'][0]['error'], payload['feeds']
+print('   bounded in', $elapsed, 's:', payload['feeds'][0]['error'])
+"
+[ "$elapsed" -lt 20 ] || { echo "   took too long: ${elapsed}s"; exit 1; }
+
+echo "== unsupported URL scheme is rejected"
+printf '[{"name": "", "url": "file://%s/fixture.ics"}]\n' "$PWD" > "$work/local-feeds.json"
+"$root/bin/protoncal-sync" --feeds "$work/local-feeds.json" > "$work/local-payload.json"
+python3 -c "
+import json
+payload = json.load(open('$work/local-payload.json'))
+assert not payload['ok'], 'a file:// feed must not be fetched'
+assert 'unsupported URL scheme' in payload['feeds'][0]['error'], payload['feeds']
+print('   rejected:', payload['feeds'][0]['error'])
+"
