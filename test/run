@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# End-to-end check of the parts that have no eyes on them: the sync backend
+# and Model.js. Runs against test/fixture.ics -- an iCalendar file shaped like
+# what Proton serves, carrying the cases that are easy to get wrong (all-day
+# with its exclusive end, a multi-day span, an event over midnight, a UTC
+# stamp, a weekly rule, and a daily rule crossing the autumn DST change).
+#
+# Fixed TZ, so the DST assertions mean the same thing on any machine.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+root=$(cd .. && pwd)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+export TZ=Europe/Stockholm
+
+printf '[{"name": "", "url": "file://%s/fixture.ics"}]\n' "$PWD" > "$work/feeds.json"
+
+echo "== backend"
+"$root/bin/protoncal-sync" --feeds "$work/feeds.json" > "$work/payload.json"
+python3 -c "
+import json, sys
+payload = json.load(open('$work/payload.json'))
+assert payload['configured'], 'feed not picked up'
+assert payload['ok'], payload['feeds']
+assert payload['events'], 'no events expanded'
+print('   feeds:', len(payload['feeds']), ' events:', len(payload['events']))
+"
+
+echo "== model"
+node model-test.js "$work/payload.json"

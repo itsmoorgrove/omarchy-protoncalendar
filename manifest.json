@@ -1,0 +1,95 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.itsmoorgrove.protoncalendar",
+  "name": "Proton Calendar",
+  "version": "0.1.0",
+  "author": "moorgrove",
+  "license": "MIT",
+  "description": "Proton Calendar in the Omarchy bar: next event, month grid, and week grid.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Proton Calendar",
+    "description": "Proton Calendar in the Omarchy bar: next event, month grid, and week grid.",
+    "category": "Time",
+    "aliases": [
+      "calendar",
+      "proton-calendar"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "refreshIntervalSec": 900,
+      "barLabel": "Title and time",
+      "defaultView": "Month",
+      "dayStartHour": 7,
+      "dayEndHour": 22,
+      "feedsFile": ""
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 60,
+        "max": 86400,
+        "step": 60,
+        "defaultValue": 900,
+        "description": "How often the shared calendar feeds are re-fetched."
+      },
+      {
+        "key": "barLabel",
+        "type": "enum",
+        "label": "Bar label",
+        "options": [
+          "Off",
+          "Title",
+          "Title and time"
+        ],
+        "defaultValue": "Title and time",
+        "description": "What the next event shows beside the bar mark. A vertical bar always shows the mark alone."
+      },
+      {
+        "key": "defaultView",
+        "type": "enum",
+        "label": "Opening view",
+        "options": [
+          "Month",
+          "Week",
+          "Upcoming"
+        ],
+        "defaultValue": "Month",
+        "description": "Which view the panel opens on. Upcoming is a dated list of everything ahead."
+      },
+      {
+        "key": "dayStartHour",
+        "type": "integer",
+        "label": "Week view starts at (hour)",
+        "min": 0,
+        "max": 23,
+        "step": 1,
+        "defaultValue": 7
+      },
+      {
+        "key": "dayEndHour",
+        "type": "integer",
+        "label": "Week view ends at (hour)",
+        "min": 1,
+        "max": 24,
+        "step": 1,
+        "defaultValue": 22
+      },
+      {
+        "key": "feedsFile",
+        "type": "path",
+        "label": "Feeds file",
+        "defaultValue": "",
+        "description": "Optional. Defaults to ~/.config/omarchy/protoncalendar/feeds.json."
+      }
+    ]
+  }
+}

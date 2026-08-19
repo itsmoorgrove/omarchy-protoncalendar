@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from datetime import date, datetime, timedelta
+
+CONFIG_DIR = os.path.expanduser("~/.config/omarchy/protoncalendar")
+CACHE_DIR = os.path.expanduser("~/.cache/omarchy/protoncalendar")
+DEFAULT_FEEDS = os.path.join(CONFIG_DIR, "feeds.json")
+
+PALETTE = [
+    "#8b7ff5",
+    "#3fb98f",
+    "#e8a33d",
+    "#e0688a",
+    "#4fa8de",
+    "#c07ee8",
+]
+
+FETCH_TIMEOUT = 20
+MAX_FEED_BYTES = 32 * 1024 * 1024
+
+
+def feeds_path(override):
+    return os.path.expanduser(override) if override else DEFAULT_FEEDS
+
+
+def load_feeds(path):
+    if not os.path.exists(path):
+        return [], ""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError) as exc:
+        return [], f"{path}: {exc}"
+
+    if isinstance(raw, dict):
+        raw = raw.get("feeds", [])
+    if not isinstance(raw, list):
+        return [], f"{path}: expected a list of feeds"
+
+    feeds = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            continue
+        url = str(entry.get("url", "")).strip()
+        if not url:
+            continue
+        feeds.append({
+            "name": str(entry.get("name", "")).strip(),
+            "url": url,
+            "color": str(entry.get("color", "")).strip() or PALETTE[index % len(PALETTE)],
+            "enabled": entry.get("enabled", True) is not False,
+        })
+    return feeds, ""
+
+
+def save_feeds(path, feeds):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = [
+        {"name": f["name"], "url": f["url"], "color": f["color"], "enabled": f["enabled"]}
+        for f in feeds
+    ]
+    write_atomic(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+
+
+def write_atomic(path, text):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    handle, temp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as out:
+            out.write(text)
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+
+
+def cache_file(url):
+    return os.path.join(CACHE_DIR, hashlib.sha256(url.encode()).hexdigest()[:16] + ".ics")
+
+
+def fetch(url):
+    path = cache_file(url)
+    try:
+        result = subprocess.run(
+            ["curl", "-sfL", "--max-time", str(FETCH_TIMEOUT),
+             "--max-filesize", str(MAX_FEED_BYTES), url],
+            capture_output=True, timeout=FETCH_TIMEOUT + 10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return read_cache(path, f"fetch failed: {exc}")
+
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        return read_cache(path, f"curl exit {result.returncode}{': ' + detail if detail else ''}")
+
+    text = result.stdout.decode("utf-8", "replace")
+    if "BEGIN:VCALENDAR" not in text:
+        return read_cache(path, "response is not iCalendar (link wrong, revoked, or expired?)")
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    try:
+        write_atomic(path, text)
+    except OSError:
+        pass
+    return text, "", False
+
+
+def read_cache(path, error):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read(), error, True
+    except OSError:
+        return "", error, False
+
+
+def local_tz():
+    name = os.environ.get("TZ", "").strip().lstrip(":")
+    if not name:
+        try:
+            link = os.path.realpath("/etc/localtime")
+            marker = "/zoneinfo/"
+            if marker in link:
+                name = link.split(marker, 1)[1]
+        except OSError:
+            name = ""
+    if name:
+        try:
+            from zoneinfo import ZoneInfo
+            return ZoneInfo(name)
+        except Exception:
+            pass
+    return datetime.now().astimezone().tzinfo
+
+
+def is_all_day(value):
+    return isinstance(value, date) and not isinstance(value, datetime)
+
+
+def to_local(value, tz):
+    if is_all_day(value):
+        return value
+    if value.tzinfo is None:
+        return value.replace(tzinfo=tz)
+    return value.astimezone(tz)
+
+
+def iso(value):
+    if is_all_day(value):
+        return value.isoformat()
+    return value.replace(microsecond=0).isoformat()
+
+
+def text_of(component, key):
+    value = component.get(key)
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def expand(text, feed, window_start, window_end, tz):
+    import icalendar
+    import recurring_ical_events
+
+    calendar = icalendar.Calendar.from_ical(text)
+    name = feed["name"] or text_of(calendar, "X-WR-CALNAME") or "Proton"
+
+    events = []
+    for component in recurring_ical_events.of(calendar).between(window_start, window_end):
+        start = component.get("DTSTART")
+        if start is None:
+            continue
+        start = start.dt
+        end = component.get("DTEND")
+        end = end.dt if end is not None else None
+
+        all_day = is_all_day(start)
+        if end is None:
+            end = start
+
+        start = to_local(start, tz)
+        end = to_local(end, tz)
+        if end < start:
+            end = start
+
+        events.append({
+            "uid": text_of(component, "UID"),
+            "title": text_of(component, "SUMMARY") or "(no title)",
+            "start": iso(start),
+            "end": iso(end),
+            "allDay": all_day,
+            "location": text_of(component, "LOCATION"),
+            "description": text_of(component, "DESCRIPTION"),
+            "status": text_of(component, "STATUS"),
+            "calendar": name,
+            "color": feed["color"],
+        })
+    return events, name
+
+
+def dedupe(events):
+    seen = set()
+    unique = []
+    for event in sorted(events, key=lambda e: (e["start"], e["title"])):
+        key = (event["uid"], event["start"], event["calendar"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(event)
+    return unique
+
+
+def sync(path, back_months, forward_months):
+    import icalendar
+    import recurring_ical_events
+
+    feeds, feeds_error = load_feeds(path)
+    tz = local_tz()
+    now = datetime.now(tz)
+
+    window_start = (now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                    - timedelta(days=31 * back_months))
+    window_end = now + timedelta(days=31 * forward_months)
+
+    report = []
+    events = []
+    for feed in feeds:
+        if not feed["enabled"]:
+            report.append({**feed_summary(feed), "ok": True, "error": "", "skipped": True})
+            continue
+
+        text, error, from_cache = fetch(feed["url"])
+        if not text:
+            report.append({**feed_summary(feed), "ok": False, "error": error or "no data"})
+            continue
+
+        try:
+            feed_events, resolved = expand(text, feed, window_start, window_end, tz)
+        except Exception as exc:
+            report.append({**feed_summary(feed), "ok": False, "error": f"parse failed: {exc}"})
+            continue
+
+        events.extend(feed_events)
+        report.append({
+            **feed_summary(feed),
+            "name": resolved,
+            "ok": not error,
+            "error": error,
+            "stale": from_cache,
+            "count": len(feed_events),
+        })
+
+    return {
+        "generatedAt": iso(now),
+        "windowStart": iso(window_start),
+        "windowEnd": iso(window_end),
+        "configured": len(feeds) > 0,
+        "feedsFile": path,
+        "error": feeds_error,
+        "ok": bool(feeds) and all(f.get("ok") for f in report),
+        "feeds": report,
+        "events": dedupe(events),
+    }
+
+
+def feed_summary(feed):
+    return {"name": feed["name"], "url": feed["url"], "color": feed["color"]}
+
+
+def result_path():
+    return os.path.join(CACHE_DIR, "events.json")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Fetch Proton Calendar share-link feeds and emit a flat event list as JSON.")
+    parser.add_argument("--feeds", default="", help="feeds file (default ~/.config/omarchy/protoncalendar/feeds.json)")
+    parser.add_argument("--cached", action="store_true", help="print the last result without fetching")
+    parser.add_argument("--add-feed", metavar="URL", help="append a feed and sync")
+    parser.add_argument("--name", default="", help="name for --add-feed")
+    parser.add_argument("--remove-feed", metavar="URL", help="drop a feed and sync")
+    parser.add_argument("--list-feeds", action="store_true", help="print the configured feeds")
+    parser.add_argument("--back-months", type=int, default=1)
+    parser.add_argument("--forward-months", type=int, default=12)
+    parser.add_argument("--json", action="store_true", help="accepted and ignored; output is always JSON")
+    args = parser.parse_args()
+
+    path = feeds_path(args.feeds)
+
+    if args.list_feeds:
+        feeds, error = load_feeds(path)
+        print(json.dumps({"feedsFile": path, "error": error, "feeds": feeds}, ensure_ascii=False))
+        return 0
+
+    if args.add_feed or args.remove_feed:
+        feeds, error = load_feeds(path)
+        if error:
+            print(json.dumps({"ok": False, "error": error}, ensure_ascii=False))
+            return 0
+        if args.add_feed:
+            url = args.add_feed.strip()
+            if any(f["url"] == url for f in feeds):
+                pass
+            else:
+                feeds.append({
+                    "name": args.name.strip(),
+                    "url": url,
+                    "color": PALETTE[len(feeds) % len(PALETTE)],
+                    "enabled": True,
+                })
+        if args.remove_feed:
+            feeds = [f for f in feeds if f["url"] != args.remove_feed.strip()]
+        try:
+            save_feeds(path, feeds)
+        except OSError as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+            return 0
+
+    if args.cached:
+        try:
+            with open(result_path(), encoding="utf-8") as handle:
+                sys.stdout.write(handle.read())
+                return 0
+        except OSError:
+            pass
+
+    try:
+        payload = sync(path, max(0, args.back_months), max(1, args.forward_months))
+    except ImportError as exc:
+        payload = {
+            "ok": False, "configured": False, "feeds": [], "events": [],
+            "error": f"missing dependency: {exc}. Install with: "
+                     "sudo pacman -S python-icalendar python-recurring-ical-events",
+        }
+
+    text = json.dumps(payload, ensure_ascii=False)
+    try:
+        write_atomic(result_path(), text)
+    except OSError:
+        pass
+    sys.stdout.write(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

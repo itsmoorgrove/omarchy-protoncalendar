@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+date=""
+title=""
+view="week"
+time=""
+prefill=0
+print_only=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --date)    date="${2:-}"; shift 2 ;;
+    --title)   title="${2:-}"; shift 2 ;;
+    --view)    view="${2:-week}"; shift 2 ;;
+    --time)    time="${2:-}"; shift 2 ;;
+    --prefill) prefill=1; shift ;;
+    --print)   print_only=1; shift ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+[[ "$view" =~ ^(week|day|month)$ ]] || { echo "bad --view: $view" >&2; exit 2; }
+
+if [[ -n "$date" ]]; then
+  [[ "$date" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]] || { echo "bad --date: $date" >&2; exit 2; }
+  url="https://calendar.proton.me/u/0/${view}/${BASH_REMATCH[1]}/$((10#${BASH_REMATCH[2]}))/$((10#${BASH_REMATCH[3]}))"
+else
+  url="https://calendar.proton.me/u/0/${view}"
+fi
+
+urlencode() {
+  local text="$1" out="" char
+  for (( i = 0; i < ${#text}; i++ )); do
+    char="${text:i:1}"
+    case "$char" in
+      [a-zA-Z0-9.~_-]) out+="$char" ;;
+      *) out+=$(printf '%%%02X' "'$char") ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+if (( prefill )) && [[ -n "$title" ]]; then
+  url+="?title=$(urlencode "$title")"
+  [[ -n "$time" ]] && url+="&startTime=$(urlencode "$time")"
+fi
+
+if (( print_only )); then
+  printf '%s\n' "$url"
+  exit 0
+fi
+
+if [[ -n "$title" ]] && command -v wl-copy >/dev/null 2>&1; then
+  printf '%s' "$title" | wl-copy
+fi
+
+exec xdg-open "$url"
