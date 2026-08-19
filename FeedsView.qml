@@ -91,6 +91,7 @@ Item {
 
             Text {
               width: parent.width
+              textFormat: Text.PlainText
               text: feedRow.modelData.name || "Calendar"
               color: root.foreground
               font.family: root.fontFamily
@@ -100,6 +101,7 @@ Item {
 
             Text {
               width: parent.width
+              textFormat: Text.PlainText
               text: {
                 var data = feedRow.modelData
                 if (data.error) return data.error

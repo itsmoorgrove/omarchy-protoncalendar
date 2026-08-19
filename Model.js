@@ -7,6 +7,10 @@ function pad2(value) {
   return (n < 10 ? "0" : "") + n
 }
 
+function plainText(value) {
+  return String(value === undefined || value === null ? "" : value).replace(/[<>]/g, "")
+}
+
 function dateKey(year, month, day) {
   return year + "-" + pad2(Number(month) + 1) + "-" + pad2(day)
 }
@@ -154,10 +158,10 @@ function parseEvent(raw) {
 
   return {
     uid: String(raw.uid || ""),
-    title: String(raw.title || "").replace(/^\s+|\s+$/g, "") || "(no title)",
-    location: String(raw.location || ""),
-    description: String(raw.description || ""),
-    calendar: String(raw.calendar || ""),
+    title: plainText(raw.title).replace(/^\s+|\s+$/g, "") || "(no title)",
+    location: plainText(raw.location),
+    description: plainText(raw.description),
+    calendar: plainText(raw.calendar),
     color: String(raw.color || ""),
     cancelled: String(raw.status || "").toUpperCase() === "CANCELLED",
     allDay: allDay,
@@ -484,13 +488,22 @@ function readPayload(text) {
   }
   if (!raw || typeof raw !== "object") return state
 
-  var feeds = raw.feeds || []
+  var feeds = []
   var stale = false
-  for (var i = 0; i < feeds.length; i++) if (feeds[i].stale || !feeds[i].ok) stale = true
+  var rawFeeds = raw.feeds || []
+  for (var i = 0; i < rawFeeds.length; i++) {
+    var feed = rawFeeds[i] || {}
+    if (feed.stale || !feed.ok) stale = true
+    var sanitized = {}
+    for (var key in feed) sanitized[key] = feed[key]
+    sanitized.name = plainText(feed.name)
+    sanitized.error = plainText(feed.error)
+    feeds.push(sanitized)
+  }
 
   state.ok = raw.ok === true
   state.configured = raw.configured === true
-  state.error = String(raw.error || "")
+  state.error = plainText(raw.error)
   state.feeds = feeds
   state.stale = stale
   state.events = parseEvents(raw.events)
@@ -523,7 +536,7 @@ if (typeof module !== "undefined") {
     upcoming: upcoming, groupByMonth: groupByMonth, hasEnded: hasEnded,
     daySegment: daySegment, layoutDay: layoutDay, weekLayout: weekLayout,
     visibleHours: visibleHours, minutesOfDay: minutesOfDay,
-    parseTime: parseTime, nextSlot: nextSlot,
+    parseTime: parseTime, nextSlot: nextSlot, plainText: plainText,
     readPayload: readPayload, firstFeedError: firstFeedError, emptyState: emptyState
   }
 }

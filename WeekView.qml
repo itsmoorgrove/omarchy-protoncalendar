@@ -153,6 +153,7 @@ Item {
               anchors.leftMargin: Style.space(5)
               anchors.rightMargin: Style.space(3)
               verticalAlignment: Text.AlignVCenter
+              textFormat: Text.PlainText
               text: modelData.title
               color: root.foreground
               font.family: root.fontFamily
@@ -259,6 +260,7 @@ Item {
                 anchors.leftMargin: Style.space(5)
                 anchors.rightMargin: Style.space(2)
                 anchors.topMargin: Style.space(1)
+                textFormat: Text.PlainText
                 text: modelData.event.title
                 color: root.foreground
                 font.family: root.fontFamily

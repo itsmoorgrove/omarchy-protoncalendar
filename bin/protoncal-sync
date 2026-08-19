@@ -160,11 +160,15 @@ def iso(value):
     return value.replace(microsecond=0).isoformat()
 
 
+def plain_text(value):
+    return str(value or "").replace("<", "").replace(">", "")
+
+
 def text_of(component, key):
     value = component.get(key)
     if value is None:
         return ""
-    return str(value).strip()
+    return plain_text(str(value).strip())
 
 
 def expand(text, feed, window_start, window_end, tz):
@@ -172,7 +176,7 @@ def expand(text, feed, window_start, window_end, tz):
     import recurring_ical_events
 
     calendar = icalendar.Calendar.from_ical(text)
-    name = feed["name"] or text_of(calendar, "X-WR-CALNAME") or "Proton"
+    name = plain_text(feed["name"]) or text_of(calendar, "X-WR-CALNAME") or "Proton"
 
     events = []
     for component in recurring_ical_events.of(calendar).between(window_start, window_end):
@@ -246,7 +250,7 @@ def sync(path, back_months, forward_months):
         try:
             feed_events, resolved = expand(text, feed, window_start, window_end, tz)
         except Exception as exc:
-            report.append({**feed_summary(feed), "ok": False, "error": f"parse failed: {exc}"})
+            report.append({**feed_summary(feed), "ok": False, "error": plain_text(f"parse failed: {exc}")})
             continue
 
         events.extend(feed_events)
@@ -273,7 +277,7 @@ def sync(path, back_months, forward_months):
 
 
 def feed_summary(feed):
-    return {"name": feed["name"], "url": feed["url"], "color": feed["color"]}
+    return {"name": plain_text(feed["name"]), "url": feed["url"], "color": feed["color"]}
 
 
 def result_path():

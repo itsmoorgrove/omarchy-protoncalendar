@@ -178,6 +178,7 @@ BarWidget {
           Text {
             visible: root.barText !== ""
             anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
             text: root.barText
             color: button.foreground
             font.family: root.labelFontFamily

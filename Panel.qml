@@ -558,6 +558,7 @@ Panel {
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
               width: parent.width - Style.space(70)
+              textFormat: Text.PlainText
               text: root.statusLine
               color: root.service && (root.service.stale || root.service.feedError !== "")
                 ? Color.urgent : root.dim

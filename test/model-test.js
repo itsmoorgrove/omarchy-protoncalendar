@@ -113,5 +113,29 @@ check("nextSlot rolls the hour", M.nextSlot(new Date(2026, 7, 16, 9, 41)).text, 
   check("group months are ascending", groups.every((g, i) => i === 0 || groups[i - 1].key < g.key), "true")
 }
 
+// A remote calendar's fields are attacker-controlled text: a title, location,
+// or description containing an HTML-like tag must never survive into the
+// data the QML views render, or Qt's default rich-text detection can turn a
+// stray <img> into a live network request.
+check("plainText strips tags", M.plainText('<img src=x onerror=alert(1)>'), "img src=x onerror=alert(1)")
+const poisoned = M.parseEvent({
+  start: "2026-08-19", allDay: true,
+  title: "Meeting <img src=http://evil/x.png>",
+  location: "<b>Office</b>",
+  description: "<script>evil()</script>",
+  calendar: "<i>Shared</i>",
+})
+check("parseEvent title has no angle brackets", /[<>]/.test(poisoned.title), "false")
+check("parseEvent location has no angle brackets", /[<>]/.test(poisoned.location), "false")
+check("parseEvent description has no angle brackets", /[<>]/.test(poisoned.description), "false")
+check("parseEvent calendar has no angle brackets", /[<>]/.test(poisoned.calendar), "false")
+
+const poisonedFeeds = M.readPayload(JSON.stringify({
+  ok: true, configured: true, events: [],
+  feeds: [{ name: "<img src=x>Evil", url: "https://x", color: "#fff", ok: false, error: "<img src=x>boom" }],
+}))
+check("feed name has no angle brackets", /[<>]/.test(poisonedFeeds.feeds[0].name), "false")
+check("feed error has no angle brackets", /[<>]/.test(poisonedFeeds.feeds[0].error), "false")
+
 console.log(fails ? `\n${fails} FAILED` : "\nall passed")
 process.exit(fails ? 1 : 0)

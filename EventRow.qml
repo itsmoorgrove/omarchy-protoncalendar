@@ -73,6 +73,7 @@ Rectangle {
 
     Text {
       width: parent.width
+      textFormat: Text.PlainText
       text: root.event ? root.event.title : ""
       color: mouse.containsMouse
         ? Style.hoverStateColor(root.foreground, Color.accent)
@@ -85,6 +86,7 @@ Rectangle {
 
     Text {
       width: parent.width
+      textFormat: Text.PlainText
       visible: root.event && root.event.location !== ""
       text: root.event ? root.event.location : ""
       color: root.dim
