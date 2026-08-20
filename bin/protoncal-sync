@@ -2,8 +2,9 @@
 import argparse
 import hashlib
 import json
+import multiprocessing
 import os
-import signal
+import resource
 import subprocess
 import sys
 import tempfile
@@ -25,30 +26,102 @@ PALETTE = [
 
 FETCH_TIMEOUT = 20
 MAX_FEED_BYTES = 32 * 1024 * 1024
-EXPANSION_TIMEOUT_SEC = 6
+EXPANSION_CPU_LIMIT_SEC = 6
+EXPANSION_MEMORY_LIMIT_BYTES = 300 * 1024 * 1024
 MAX_EVENTS_PER_FEED = 3000
 MAX_EVENTS_TOTAL = 10000
 
 
-class ExpansionTimeout(Exception):
+class ExpansionAborted(Exception):
     pass
 
 
-def _expansion_alarm(signum, frame):
-    raise ExpansionTimeout(f"recurrence expansion exceeded {EXPANSION_TIMEOUT_SEC}s")
-
-
-def expand_bounded(query, window_start, window_end):
-    previous = signal.signal(signal.SIGALRM, _expansion_alarm)
-    signal.alarm(EXPANSION_TIMEOUT_SEC)
+def _expand_worker(text, feed, window_start, window_end, tz, out_queue):
     try:
-        occurrences = query.between(window_start, window_end)
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, previous)
+        resource.setrlimit(resource.RLIMIT_CPU, (EXPANSION_CPU_LIMIT_SEC, EXPANSION_CPU_LIMIT_SEC))
+        resource.setrlimit(resource.RLIMIT_AS, (EXPANSION_MEMORY_LIMIT_BYTES, EXPANSION_MEMORY_LIMIT_BYTES))
+    except (ValueError, OSError):
+        pass
 
-    truncated = len(occurrences) > MAX_EVENTS_PER_FEED
-    return occurrences[:MAX_EVENTS_PER_FEED], truncated
+    try:
+        import icalendar
+        import recurring_ical_events
+
+        calendar = icalendar.Calendar.from_ical(text)
+        name = plain_text(feed["name"]) or text_of(calendar, "X-WR-CALNAME") or "Proton"
+
+        occurrences = recurring_ical_events.of(calendar).between(window_start, window_end)
+        truncated = len(occurrences) > MAX_EVENTS_PER_FEED
+        occurrences = occurrences[:MAX_EVENTS_PER_FEED]
+
+        events = []
+        for component in occurrences:
+            start = component.get("DTSTART")
+            if start is None:
+                continue
+            start = start.dt
+            end = component.get("DTEND")
+            end = end.dt if end is not None else None
+
+            all_day = is_all_day(start)
+            if end is None:
+                end = start
+
+            start = to_local(start, tz)
+            end = to_local(end, tz)
+            if end < start:
+                end = start
+
+            events.append({
+                "uid": text_of(component, "UID"),
+                "title": text_of(component, "SUMMARY") or "(no title)",
+                "start": iso(start),
+                "end": iso(end),
+                "allDay": all_day,
+                "location": text_of(component, "LOCATION"),
+                "description": text_of(component, "DESCRIPTION"),
+                "status": text_of(component, "STATUS"),
+                "calendar": name,
+                "color": feed["color"],
+            })
+        out_queue.put(("ok", events, name, truncated))
+    except MemoryError:
+        out_queue.put(("error", "memory limit exceeded (possible hostile recurrence rule)"))
+    except Exception as exc:
+        out_queue.put(("error", f"parse failed: {exc}"))
+
+
+def expand_isolated(text, feed, window_start, window_end, tz):
+    # recurring_ical_events materializes the full occurrence list before
+    # returning, so a high-frequency RRULE (FREQ=SECONDLY with no COUNT or
+    # UNTIL) can already exhaust memory before any cap on the *result* would
+    # help. Doing the expansion in a child process with hard CPU and address
+    # space rlimits bounds both, enforced by the kernel rather than by
+    # anything this script could fail to catch.
+    ctx = multiprocessing.get_context("fork")
+    out_queue = ctx.Queue()
+    worker = ctx.Process(
+        target=_expand_worker, args=(text, feed, window_start, window_end, tz, out_queue)
+    )
+    worker.start()
+    worker.join(EXPANSION_CPU_LIMIT_SEC + 4)
+
+    if worker.is_alive():
+        worker.kill()
+        worker.join()
+        raise ExpansionAborted(f"recurrence expansion exceeded {EXPANSION_CPU_LIMIT_SEC}s")
+
+    try:
+        status, *rest = out_queue.get(timeout=1)
+    except Exception:
+        detail = f"exit code {worker.exitcode}" if worker.exitcode else "no result"
+        raise ExpansionAborted(
+            f"recurrence expansion aborted ({detail}, possible hostile recurrence rule)"
+        )
+
+    if status == "error":
+        raise ExpansionAborted(rest[0])
+    return rest[0], rest[1], rest[2]
 
 
 def feeds_path(override):
@@ -114,6 +187,15 @@ def cache_file(url):
     return os.path.join(CACHE_DIR, hashlib.sha256(url.encode()).hexdigest()[:16] + ".ics")
 
 
+def curl_config(url):
+    # The URL is a bearer-style secret (anyone holding it can read the
+    # calendar), and process arguments are world-readable via /proc/<pid>/
+    # cmdline on a typical Linux system. Handing it to curl through a
+    # config file piped over stdin (-K -) keeps it out of argv/ps entirely.
+    escaped = url.replace("\\", "\\\\").replace('"', '\\"')
+    return f'url = "{escaped}"\n'
+
+
 def fetch(url):
     path = cache_file(url)
     scheme = urllib.parse.urlsplit(url).scheme.lower()
@@ -121,9 +203,10 @@ def fetch(url):
         return read_cache(path, f"unsupported URL scheme: {scheme or '(none)'}")
     try:
         result = subprocess.run(
-            ["curl", "-sfL", "--proto", "=http,https", "--proto-redir", "=http,https",
+            ["curl", "-sfL", "-K", "-", "--proto", "=http,https", "--proto-redir", "=http,https",
              "--max-time", str(FETCH_TIMEOUT),
-             "--max-filesize", str(MAX_FEED_BYTES), url],
+             "--max-filesize", str(MAX_FEED_BYTES)],
+            input=curl_config(url).encode("utf-8"),
             capture_output=True, timeout=FETCH_TIMEOUT + 10,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -202,47 +285,7 @@ def text_of(component, key):
 
 
 def expand(text, feed, window_start, window_end, tz):
-    import icalendar
-    import recurring_ical_events
-
-    calendar = icalendar.Calendar.from_ical(text)
-    name = plain_text(feed["name"]) or text_of(calendar, "X-WR-CALNAME") or "Proton"
-
-    occurrences, truncated = expand_bounded(
-        recurring_ical_events.of(calendar), window_start, window_end
-    )
-
-    events = []
-    for component in occurrences:
-        start = component.get("DTSTART")
-        if start is None:
-            continue
-        start = start.dt
-        end = component.get("DTEND")
-        end = end.dt if end is not None else None
-
-        all_day = is_all_day(start)
-        if end is None:
-            end = start
-
-        start = to_local(start, tz)
-        end = to_local(end, tz)
-        if end < start:
-            end = start
-
-        events.append({
-            "uid": text_of(component, "UID"),
-            "title": text_of(component, "SUMMARY") or "(no title)",
-            "start": iso(start),
-            "end": iso(end),
-            "allDay": all_day,
-            "location": text_of(component, "LOCATION"),
-            "description": text_of(component, "DESCRIPTION"),
-            "status": text_of(component, "STATUS"),
-            "calendar": name,
-            "color": feed["color"],
-        })
-    return events, name, truncated
+    return expand_isolated(text, feed, window_start, window_end, tz)
 
 
 def dedupe(events):
@@ -283,7 +326,7 @@ def sync(path, back_months, forward_months):
 
         try:
             feed_events, resolved, truncated = expand(text, feed, window_start, window_end, tz)
-        except ExpansionTimeout as exc:
+        except ExpansionAborted as exc:
             report.append({**feed_summary(feed), "ok": False, "error": plain_text(str(exc))})
             continue
         except Exception as exc:
@@ -331,8 +374,13 @@ def main():
     parser.add_argument("--feeds", default="", help="feeds file (default ~/.config/omarchy/protoncalendar/feeds.json)")
     parser.add_argument("--cached", action="store_true", help="print the last result without fetching")
     parser.add_argument("--add-feed", metavar="URL", help="append a feed and sync")
+    parser.add_argument("--add-feed-env", action="store_true",
+                         help="like --add-feed, but read the URL from $PROTONCAL_FEED_URL "
+                              "instead of argv (argv is world-readable via /proc)")
     parser.add_argument("--name", default="", help="name for --add-feed")
     parser.add_argument("--remove-feed", metavar="URL", help="drop a feed and sync")
+    parser.add_argument("--remove-feed-env", action="store_true",
+                         help="like --remove-feed, but read the URL from $PROTONCAL_FEED_URL")
     parser.add_argument("--list-feeds", action="store_true", help="print the configured feeds")
     parser.add_argument("--back-months", type=int, default=1)
     parser.add_argument("--forward-months", type=int, default=12)
@@ -346,13 +394,16 @@ def main():
         print(json.dumps({"feedsFile": path, "error": error, "feeds": feeds}, ensure_ascii=False))
         return 0
 
-    if args.add_feed or args.remove_feed:
+    add_url = os.environ.get("PROTONCAL_FEED_URL", "") if args.add_feed_env else args.add_feed
+    remove_url = os.environ.get("PROTONCAL_FEED_URL", "") if args.remove_feed_env else args.remove_feed
+
+    if add_url or remove_url:
         feeds, error = load_feeds(path)
         if error:
             print(json.dumps({"ok": False, "error": error}, ensure_ascii=False))
             return 0
-        if args.add_feed:
-            url = args.add_feed.strip()
+        if add_url:
+            url = add_url.strip()
             if any(f["url"] == url for f in feeds):
                 pass
             else:
@@ -362,8 +413,8 @@ def main():
                     "color": PALETTE[len(feeds) % len(PALETTE)],
                     "enabled": True,
                 })
-        if args.remove_feed:
-            feeds = [f for f in feeds if f["url"] != args.remove_feed.strip()]
+        if remove_url:
+            feeds = [f for f in feeds if f["url"] != remove_url.strip()]
         try:
             save_feeds(path, feeds)
         except OSError as exc:

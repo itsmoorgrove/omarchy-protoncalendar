@@ -92,13 +92,15 @@ Item {
   function addFeed(url, name) {
     var trimmed = String(url || "").replace(/^\s+|\s+$/g, "")
     if (trimmed === "" || feedProcess.running) return
-    feedProcess.command = syncArgs(["--add-feed", trimmed, "--name", String(name || "")])
+    feedProcess.environment = { "PROTONCAL_FEED_URL": trimmed }
+    feedProcess.command = syncArgs(["--add-feed-env", "--name", String(name || "")])
     feedProcess.running = true
   }
 
   function removeFeed(url) {
     if (feedProcess.running) return
-    feedProcess.command = syncArgs(["--remove-feed", String(url)])
+    feedProcess.environment = { "PROTONCAL_FEED_URL": String(url) }
+    feedProcess.command = syncArgs(["--remove-feed-env"])
     feedProcess.running = true
   }
 

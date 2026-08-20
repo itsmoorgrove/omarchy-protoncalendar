@@ -53,7 +53,7 @@ python3 -c "
 import json
 payload = json.load(open('$work/hostile-payload.json'))
 assert not payload['ok'], 'a runaway RRULE must not report ok'
-assert 'exceeded' in payload['feeds'][0]['error'], payload['feeds']
+assert 'recurrence' in payload['feeds'][0]['error'], payload['feeds']
 print('   bounded in', $elapsed, 's:', payload['feeds'][0]['error'])
 "
 [ "$elapsed" -lt 20 ] || { echo "   took too long: ${elapsed}s"; exit 1; }
@@ -67,4 +67,37 @@ payload = json.load(open('$work/local-payload.json'))
 assert not payload['ok'], 'a file:// feed must not be fetched'
 assert 'unsupported URL scheme' in payload['feeds'][0]['error'], payload['feeds']
 print('   rejected:', payload['feeds'][0]['error'])
+"
+
+echo "== --add-feed-env / --remove-feed-env (URL via \$PROTONCAL_FEED_URL, not argv)"
+echo '[]' > "$work/manage-feeds.json"
+secret_url="http://127.0.0.1:$port/fixture.ics"
+PROTONCAL_FEED_URL="$secret_url" "$root/bin/protoncal-sync" \
+  --feeds "$work/manage-feeds.json" --add-feed-env --name Watched >/dev/null
+python3 -c "
+import json
+feeds = json.load(open('$work/manage-feeds.json'))
+assert feeds and feeds[0]['url'] == '$secret_url', feeds
+print('   added via env:', feeds[0]['name'])
+"
+PROTONCAL_FEED_URL="$secret_url" "$root/bin/protoncal-sync" \
+  --feeds "$work/manage-feeds.json" --remove-feed-env >/dev/null
+python3 -c "
+import json
+feeds = json.load(open('$work/manage-feeds.json'))
+assert feeds == [], feeds
+print('   removed via env')
+"
+
+echo "== classic --add-feed / --remove-feed (documented CLI usage) still work"
+echo '[]' > "$work/cli-feeds.json"
+"$root/bin/protoncal-sync" --feeds "$work/cli-feeds.json" \
+  --add-feed "http://127.0.0.1:$port/fixture.ics" --name CLI >/dev/null
+"$root/bin/protoncal-sync" --feeds "$work/cli-feeds.json" \
+  --remove-feed "http://127.0.0.1:$port/fixture.ics" >/dev/null
+python3 -c "
+import json
+feeds = json.load(open('$work/cli-feeds.json'))
+assert feeds == [], feeds
+print('   add/remove via argv still works')
 "
