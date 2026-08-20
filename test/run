@@ -105,6 +105,36 @@ assert 'private' in payload['feeds'][0]['error'], payload['feeds']
 print('   rejected:', payload['feeds'][0]['error'])
 "
 
+echo "== a redirect hop is revalidated, not just the initial host (SSRF via redirect)"
+redirect_port=$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()")
+python3 -c "
+import http.server, sys
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(302)
+        self.send_header('Location', 'file:///etc/passwd')
+        self.end_headers()
+    def log_message(self, *a):
+        pass
+http.server.HTTPServer(('127.0.0.1', $redirect_port), Handler).serve_forever()
+" >/dev/null 2>&1 &
+redirect_pid=$!
+for _ in $(seq 1 50); do
+  curl -s -o /dev/null "http://127.0.0.1:$redirect_port/" && break
+  sleep 0.1
+done
+
+printf '[{"name": "", "url": "http://127.0.0.1:%s/"}]\n' "$redirect_port" > "$work/redirect-feeds.json"
+"$root/bin/protoncal-sync" --feeds "$work/redirect-feeds.json" > "$work/redirect-payload.json"
+kill "$redirect_pid" 2>/dev/null; wait "$redirect_pid" 2>/dev/null || true
+python3 -c "
+import json
+payload = json.load(open('$work/redirect-payload.json'))
+assert not payload['ok'], 'a redirect to file:// must not be followed'
+assert 'unsupported URL scheme' in payload['feeds'][0]['error'], payload['feeds']
+print('   redirect target revalidated and rejected:', payload['feeds'][0]['error'])
+"
+
 echo "== classic --add-feed / --remove-feed (documented CLI usage) still work"
 echo '[]' > "$work/cli-feeds.json"
 "$root/bin/protoncal-sync" --feeds "$work/cli-feeds.json" \

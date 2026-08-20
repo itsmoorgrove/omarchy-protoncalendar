@@ -5,6 +5,7 @@ import ipaddress
 import json
 import multiprocessing
 import os
+import re
 import resource
 import socket
 import subprocess
@@ -230,46 +231,88 @@ def curl_config(url):
     return f'url = "{escaped}"\n'
 
 
-def fetch(url):
-    path = cache_file(url)
+MAX_REDIRECTS = 5
+STATUS_LINE_RE = re.compile(r"^HTTP/\S+\s+(\d\d\d)", re.MULTILINE)
+LOCATION_RE = re.compile(r"^Location:\s*(\S+)", re.IGNORECASE | re.MULTILINE)
+
+
+def fetch_one_hop(url):
+    """One request, redirects NOT followed by curl -- the caller revalidates
+    and re-pins each hop itself, so a public feed can't redirect to a
+    loopback/private address once the initial host has passed the check."""
     parsed = urllib.parse.urlsplit(url)
     scheme = parsed.scheme.lower()
     if scheme not in ("http", "https"):
-        return read_cache(path, f"unsupported URL scheme: {scheme or '(none)'}")
+        return None, None, f"unsupported URL scheme: {scheme or '(none)'}"
     if not parsed.hostname:
-        return read_cache(path, "URL has no host")
+        return None, None, "URL has no host"
 
     port = parsed.port or (443 if scheme == "https" else 80)
     ip, dns_error = resolve_public_ip(parsed.hostname, port)
     if dns_error:
-        return read_cache(path, dns_error)
+        return None, None, dns_error
 
+    handle, header_path = tempfile.mkstemp(prefix=".hdr-")
+    os.close(handle)
     try:
         result = subprocess.run(
-            ["curl", "-sfL", "-K", "-", "--proto", "=http,https", "--proto-redir", "=http,https",
+            ["curl", "-s", "-K", "-", "--proto", "=http,https",
              "--resolve", f"{parsed.hostname}:{port}:{ip}",
-             "--max-redirs", "5",
              "--max-time", str(FETCH_TIMEOUT),
-             "--max-filesize", str(MAX_FEED_BYTES)],
+             "--max-filesize", str(MAX_FEED_BYTES),
+             "-D", header_path],
             input=curl_config(url).encode("utf-8"),
             capture_output=True, timeout=FETCH_TIMEOUT + 10,
         )
+        with open(header_path, encoding="utf-8", errors="replace") as handle:
+            headers = handle.read()
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return read_cache(path, f"fetch failed: {exc}")
+        return None, None, f"fetch failed: {exc}"
+    finally:
+        try:
+            os.unlink(header_path)
+        except OSError:
+            pass
 
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", "replace").strip()
-        return read_cache(path, f"curl exit {result.returncode}{': ' + detail if detail else ''}")
+        return None, None, f"curl exit {result.returncode}{': ' + detail if detail else ''}"
 
-    text = result.stdout.decode("utf-8", "replace")
-    if "BEGIN:VCALENDAR" not in text:
-        return read_cache(path, "response is not iCalendar (link wrong, revoked, or expired?)")
+    status_match = STATUS_LINE_RE.findall(headers)
+    status = int(status_match[-1]) if status_match else None
 
-    try:
-        write_atomic(path, text)
-    except OSError:
-        pass
-    return text, "", False
+    if status in (301, 302, 303, 307, 308):
+        location_match = LOCATION_RE.findall(headers)
+        if not location_match:
+            return None, None, f"redirect with no Location header (status {status})"
+        return None, urllib.parse.urljoin(url, location_match[-1].strip()), None
+
+    if status is None or status >= 400:
+        return None, None, f"HTTP {status}" if status else "no HTTP status in response"
+
+    return result.stdout.decode("utf-8", "replace"), None, None
+
+
+def fetch(url):
+    path = cache_file(url)
+    current = url
+    for _ in range(MAX_REDIRECTS + 1):
+        text, redirect_to, error = fetch_one_hop(current)
+        if error:
+            return read_cache(path, error)
+        if redirect_to:
+            current = redirect_to
+            continue
+
+        if "BEGIN:VCALENDAR" not in text:
+            return read_cache(path, "response is not iCalendar (link wrong, revoked, or expired?)")
+        try:
+            write_atomic(path, text)
+        except OSError:
+            pass
+        return text, "", False
+
+    return read_cache(path, "too many redirects")
 
 
 def read_cache(path, error):
