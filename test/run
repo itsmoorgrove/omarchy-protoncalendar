@@ -27,6 +27,10 @@ for _ in $(seq 1 50); do
 done
 
 export TZ=Europe/Stockholm
+# The tests' own fixture server is on loopback, which fetch() blocks by
+# default (see the SSRF test below for proof that it actually does). Only
+# the test harness sets this -- a real sync never does.
+export PROTONCAL_ALLOW_PRIVATE_HOSTS=1
 
 printf '[{"name": "", "url": "http://127.0.0.1:%s/fixture.ics"}]\n' "$port" > "$work/feeds.json"
 
@@ -87,6 +91,18 @@ import json
 feeds = json.load(open('$work/manage-feeds.json'))
 assert feeds == [], feeds
 print('   removed via env')
+"
+
+echo "== a feed pointing at a private/internal address is refused (SSRF)"
+printf '[{"name": "", "url": "http://127.0.0.1:%s/fixture.ics"}]\n' "$port" > "$work/ssrf-feeds.json"
+env -u PROTONCAL_ALLOW_PRIVATE_HOSTS "$root/bin/protoncal-sync" \
+  --feeds "$work/ssrf-feeds.json" > "$work/ssrf-payload.json"
+python3 -c "
+import json
+payload = json.load(open('$work/ssrf-payload.json'))
+assert not payload['ok'], 'a loopback-address feed must not be fetched'
+assert 'private' in payload['feeds'][0]['error'], payload['feeds']
+print('   rejected:', payload['feeds'][0]['error'])
 "
 
 echo "== classic --add-feed / --remove-feed (documented CLI usage) still work"

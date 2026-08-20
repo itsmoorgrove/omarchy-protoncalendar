@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import argparse
 import hashlib
+import ipaddress
 import json
 import multiprocessing
 import os
 import resource
+import socket
 import subprocess
 import sys
 import tempfile
@@ -30,6 +32,7 @@ EXPANSION_CPU_LIMIT_SEC = 6
 EXPANSION_MEMORY_LIMIT_BYTES = 300 * 1024 * 1024
 MAX_EVENTS_PER_FEED = 3000
 MAX_EVENTS_TOTAL = 10000
+MAX_FEEDS = 50
 
 
 class ExpansionAborted(Exception):
@@ -132,6 +135,10 @@ def load_feeds(path):
     if not os.path.exists(path):
         return [], ""
     try:
+        os.chmod(os.path.dirname(path) or ".", 0o700)
+    except OSError:
+        pass
+    try:
         with open(path, encoding="utf-8") as handle:
             raw = json.load(handle)
     except (OSError, ValueError) as exc:
@@ -159,7 +166,7 @@ def load_feeds(path):
 
 
 def save_feeds(path, feeds):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    ensure_private_dir(os.path.dirname(path))
     payload = [
         {"name": f["name"], "url": f["url"], "color": f["color"], "enabled": f["enabled"]}
         for f in feeds
@@ -167,9 +174,20 @@ def save_feeds(path, feeds):
     write_atomic(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
 
 
+def ensure_private_dir(directory):
+    # feeds.json and the cached .ics files hold share-link URLs, which are
+    # bearer-style secrets -- keep the directory owner-only rather than
+    # relying only on the files inside it being 0600.
+    os.makedirs(directory, exist_ok=True)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
+
+
 def write_atomic(path, text):
     directory = os.path.dirname(path) or "."
-    os.makedirs(directory, exist_ok=True)
+    ensure_private_dir(directory)
     handle, temp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as out:
@@ -187,6 +205,22 @@ def cache_file(url):
     return os.path.join(CACHE_DIR, hashlib.sha256(url.encode()).hexdigest()[:16] + ".ics")
 
 
+def resolve_public_ip(hostname, port):
+    try:
+        infos = socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        return None, f"DNS resolution failed: {exc}"
+
+    allow_private = os.environ.get("PROTONCAL_ALLOW_PRIVATE_HOSTS") == "1"
+    for family, _, _, _, sockaddr in infos:
+        ip = ipaddress.ip_address(sockaddr[0])
+        if not allow_private and (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+            continue
+        return sockaddr[0], None
+    return None, "resolves only to a private/internal address"
+
+
 def curl_config(url):
     # The URL is a bearer-style secret (anyone holding it can read the
     # calendar), and process arguments are world-readable via /proc/<pid>/
@@ -198,12 +232,23 @@ def curl_config(url):
 
 def fetch(url):
     path = cache_file(url)
-    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    parsed = urllib.parse.urlsplit(url)
+    scheme = parsed.scheme.lower()
     if scheme not in ("http", "https"):
         return read_cache(path, f"unsupported URL scheme: {scheme or '(none)'}")
+    if not parsed.hostname:
+        return read_cache(path, "URL has no host")
+
+    port = parsed.port or (443 if scheme == "https" else 80)
+    ip, dns_error = resolve_public_ip(parsed.hostname, port)
+    if dns_error:
+        return read_cache(path, dns_error)
+
     try:
         result = subprocess.run(
             ["curl", "-sfL", "-K", "-", "--proto", "=http,https", "--proto-redir", "=http,https",
+             "--resolve", f"{parsed.hostname}:{port}:{ip}",
+             "--max-redirs", "5",
              "--max-time", str(FETCH_TIMEOUT),
              "--max-filesize", str(MAX_FEED_BYTES)],
             input=curl_config(url).encode("utf-8"),
@@ -220,7 +265,6 @@ def fetch(url):
     if "BEGIN:VCALENDAR" not in text:
         return read_cache(path, "response is not iCalendar (link wrong, revoked, or expired?)")
 
-    os.makedirs(CACHE_DIR, exist_ok=True)
     try:
         write_atomic(path, text)
     except OSError:
@@ -305,6 +349,9 @@ def sync(path, back_months, forward_months):
     import recurring_ical_events
 
     feeds, feeds_error = load_feeds(path)
+    if len(feeds) > MAX_FEEDS:
+        feeds = feeds[:MAX_FEEDS]
+        feeds_error = feeds_error or f"only the first {MAX_FEEDS} feeds are synced"
     tz = local_tz()
     now = datetime.now(tz)
 
