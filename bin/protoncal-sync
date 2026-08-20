@@ -212,11 +212,14 @@ def resolve_public_ip(hostname, port):
     except socket.gaierror as exc:
         return None, f"DNS resolution failed: {exc}"
 
+    # is_global is the inverse of every non-routable range the stdlib knows
+    # about -- RFC1918, loopback, link-local, CGNAT (100.64.0.0/10),
+    # documentation/test ranges, etc. -- rather than a hand-picked list this
+    # script would have to keep in sync with every SSRF target class itself.
     allow_private = os.environ.get("PROTONCAL_ALLOW_PRIVATE_HOSTS") == "1"
     for family, _, _, _, sockaddr in infos:
         ip = ipaddress.ip_address(sockaddr[0])
-        if not allow_private and (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+        if not allow_private and not ip.is_global:
             continue
         return sockaddr[0], None
     return None, "resolves only to a private/internal address"
@@ -239,16 +242,34 @@ LOCATION_RE = re.compile(r"^Location:\s*(\S+)", re.IGNORECASE | re.MULTILINE)
 def fetch_one_hop(url):
     """One request, redirects NOT followed by curl -- the caller revalidates
     and re-pins each hop itself, so a public feed can't redirect to a
-    loopback/private address once the initial host has passed the check."""
-    parsed = urllib.parse.urlsplit(url)
-    scheme = parsed.scheme.lower()
+    loopback/private address once the initial host has passed the check.
+
+    A malformed URL -- including one a redirect's Location header hands us,
+    which is remote-controlled -- must fail this one hop, not raise: urlsplit
+    and its .hostname/.port properties throw ValueError on things like an
+    unterminated IPv6 bracket, and an uncaught exception here would abort
+    sync() for every other feed too, not just this one."""
+    if any(c in url for c in "\r\n\x00"):
+        # curl_config() hands the URL to curl as a config-file line. A CR or
+        # LF inside it would start a *second* config directive -- e.g. a
+        # trailing `\nurl = "http://169.254.169.254/..."` -- that curl would
+        # honor instead of (or as well as) the one just validated below.
+        return None, None, "malformed URL: contains a control character"
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        return None, None, f"malformed URL: {exc}"
+
     if scheme not in ("http", "https"):
         return None, None, f"unsupported URL scheme: {scheme or '(none)'}"
-    if not parsed.hostname:
+    if not hostname:
         return None, None, "URL has no host"
 
-    port = parsed.port or (443 if scheme == "https" else 80)
-    ip, dns_error = resolve_public_ip(parsed.hostname, port)
+    port = port or (443 if scheme == "https" else 80)
+    ip, dns_error = resolve_public_ip(hostname, port)
     if dns_error:
         return None, None, dns_error
 
@@ -257,7 +278,7 @@ def fetch_one_hop(url):
     try:
         result = subprocess.run(
             ["curl", "-s", "-K", "-", "--proto", "=http,https",
-             "--resolve", f"{parsed.hostname}:{port}:{ip}",
+             "--resolve", f"{hostname}:{port}:{ip}",
              "--max-time", str(FETCH_TIMEOUT),
              "--max-filesize", str(MAX_FEED_BYTES),
              "-D", header_path],
@@ -285,7 +306,11 @@ def fetch_one_hop(url):
         location_match = LOCATION_RE.findall(headers)
         if not location_match:
             return None, None, f"redirect with no Location header (status {status})"
-        return None, urllib.parse.urljoin(url, location_match[-1].strip()), None
+        try:
+            next_url = urllib.parse.urljoin(url, location_match[-1].strip())
+        except ValueError as exc:
+            return None, None, f"malformed redirect target: {exc}"
+        return None, next_url, None
 
     if status is None or status >= 400:
         return None, None, f"HTTP {status}" if status else "no HTTP status in response"
@@ -409,7 +434,14 @@ def sync(path, back_months, forward_months):
             report.append({**feed_summary(feed), "ok": True, "error": "", "skipped": True})
             continue
 
-        text, error, from_cache = fetch(feed["url"])
+        try:
+            text, error, from_cache = fetch(feed["url"])
+        except Exception as exc:
+            # Belt and suspenders alongside the try/except inside fetch_one_hop:
+            # one feed misbehaving -- however it manages to -- must not take
+            # every other feed in this sync down with it.
+            report.append({**feed_summary(feed), "ok": False, "error": plain_text(f"fetch failed: {exc}")})
+            continue
         if not text:
             report.append({**feed_summary(feed), "ok": False, "error": error or "no data"})
             continue
@@ -526,6 +558,15 @@ def main():
             "ok": False, "configured": False, "feeds": [], "events": [],
             "error": f"missing dependency: {exc}. Install with: "
                      "sudo pacman -S python-icalendar python-recurring-ical-events",
+        }
+    except Exception as exc:
+        # Every expected failure mode inside sync() is caught per-feed
+        # already; this is only the backstop for whatever isn't -- the
+        # panel should show "sync failed", never lose its last good cache
+        # to a bare traceback and a non-zero exit.
+        payload = {
+            "ok": False, "configured": False, "feeds": [], "events": [],
+            "error": plain_text(f"sync failed: {exc}"),
         }
 
     text = json.dumps(payload, ensure_ascii=False)
