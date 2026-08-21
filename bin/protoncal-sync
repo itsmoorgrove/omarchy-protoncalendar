@@ -108,20 +108,32 @@ def expand_isolated(text, feed, window_start, window_end, tz):
         target=_expand_worker, args=(text, feed, window_start, window_end, tz, out_queue)
     )
     worker.start()
-    worker.join(EXPANSION_CPU_LIMIT_SEC + 4)
 
-    if worker.is_alive():
-        worker.kill()
-        worker.join()
-        raise ExpansionAborted(f"recurrence expansion exceeded {EXPANSION_CPU_LIMIT_SEC}s")
-
+    # Read from the queue *before* joining, not after. The result is pickled
+    # and sent through an OS pipe with a fixed (typically 64KB) buffer; a feed
+    # with a few hundred occurrences easily produces a payload several times
+    # that size. If we join() first, the child's queue-feeder thread blocks
+    # writing to a pipe nobody is draining, the child can never exit, and
+    # join() waits for an exit that will never come -- a guaranteed deadlock
+    # that has nothing to do with how long the expansion actually took.
     try:
-        status, *rest = out_queue.get(timeout=1)
+        status, *rest = out_queue.get(timeout=EXPANSION_CPU_LIMIT_SEC + 4)
     except Exception:
+        still_running = worker.is_alive()
+        if still_running:
+            worker.kill()
+        worker.join(1)
+        if still_running:
+            raise ExpansionAborted(f"recurrence expansion exceeded {EXPANSION_CPU_LIMIT_SEC}s")
         detail = f"exit code {worker.exitcode}" if worker.exitcode else "no result"
         raise ExpansionAborted(
             f"recurrence expansion aborted ({detail}, possible hostile recurrence rule)"
         )
+
+    worker.join(1)
+    if worker.is_alive():
+        worker.kill()
+        worker.join()
 
     if status == "error":
         raise ExpansionAborted(rest[0])
