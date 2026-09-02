@@ -738,11 +738,26 @@ function upcoming(events, now) {
 }
 
 function eventMatches(event, query) {
-  var needle = String(query || "").replace(/^\s+|\s+$/g, "").toLowerCase()
-  if (!needle) return true
+  var needles = String(query || "").toLowerCase().split(/\s+/).filter(function (needle) {
+    return needle !== ""
+  })
+  if (!needles.length) return true
   var values = [event.title, event.location, event.description, event.calendar,
-    event.organizer, event.attendees ? event.attendees.join(" ") : ""]
-  return values.join(" ").toLowerCase().indexOf(needle) >= 0
+    event.organizer]
+  if (event.attendees) values = values.concat(event.attendees)
+  // Whitespace is dropped inside each value, so a query typed without it still
+  // lands: "utansluttid" finds "Utan sluttid". The other direction is already
+  // covered, since the query is matched one word at a time. Values are squashed
+  // before they are joined, so a needle cannot run from one into the next.
+  var squashed = []
+  for (var v = 0; v < values.length; v++) {
+    squashed.push(String(values[v] || "").replace(/\s+/g, ""))
+  }
+  var haystack = squashed.join(" ").toLowerCase()
+  for (var i = 0; i < needles.length; i++) {
+    if (haystack.indexOf(needles[i]) < 0) return false
+  }
+  return true
 }
 
 function eventInScope(event, scope, now, weekStart) {
