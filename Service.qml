@@ -51,6 +51,7 @@ Item {
   property var notificationQueue: []
   property string notificationPayload: ""
   property string copyPayload: ""
+  property string pendingSound: ""
 
   SystemClock {
     id: clock
@@ -118,13 +119,25 @@ Item {
   }
 
   function previewSound(value) {
-    Quickshell.execDetached(["canberra-gtk-play", "--id", soundId(value),
-      "--description", language === "sv" ? "Proton Calendar-påminnelse" : "Proton Calendar reminder"])
+    var sound = normalizedSound(value)
+    if (soundProcess.running) {
+      pendingSound = sound
+      soundProcess.running = false
+      return
+    }
+    playSound(sound)
+  }
+
+  function playSound(sound) {
+    soundProcess.command = ["canberra-gtk-play", "--id", soundId(sound),
+      "--description", language === "sv" ? "Proton Calendar-påminnelse" : "Proton Calendar reminder"]
+    soundProcess.running = true
   }
 
   function checkReminders() {
     if (!notificationsEnabled || !events) return
     var stamp = now.getTime()
+    var soundNeeded = false
     for (var i = 0; i < events.length; i++) {
       var event = events[i]
       if (!event || event.cancelled) continue
@@ -157,9 +170,10 @@ Item {
           : Model.formatTime(event.start, timeFormat)
         var body = when + (event.location ? " · " + event.location : "")
         sendNotification(event, body, 0)
-        if (notificationSoundEnabled) previewSound(notificationSound)
+        soundNeeded = true
       }
     }
+    if (soundNeeded && notificationSoundEnabled) previewSound(notificationSound)
   }
 
   function sendNotification(event, body, delaySeconds) {
@@ -347,6 +361,17 @@ Item {
   Process {
     id: openProcess
     command: []
+  }
+
+  Process {
+    id: soundProcess
+    command: []
+    onExited: function () {
+      if (root.pendingSound === "") return
+      var next = root.pendingSound
+      root.pendingSound = ""
+      root.playSound(next)
+    }
   }
 
   Process {
