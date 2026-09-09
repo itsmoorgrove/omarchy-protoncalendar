@@ -115,11 +115,12 @@ Panel {
   }
 
   function close() {
-    setCenterHoverRevealSuppressed(false)
+    // Hide first: nothing after this line may be able to strand the panel open.
+    root.controller.hide()
     root.addOpen = false
     root.settingsOpen = false
     root.selectedEvent = null
-    root.controller.hide()
+    setCenterHoverRevealSuppressed(false)
   }
 
   function toggle() {
@@ -134,8 +135,11 @@ Panel {
   }
 
   function setCenterHoverRevealSuppressed(value) {
-    if (root.bar && "centerHoverRevealSuppressed" in root.bar)
-      root.bar.centerHoverRevealSuppressed = value
+    // The bar hands plugins a PluginBarApi where centerHoverRevealSuppressed is
+    // readonly; assigning it throws and aborts whatever called us. Go through
+    // the setter the api exposes for exactly this.
+    if (root.bar && typeof root.bar.setCenterHoverRevealSuppressed === "function")
+      root.bar.setCenterHoverRevealSuppressed(value)
   }
 
   function refresh() {
