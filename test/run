@@ -63,6 +63,21 @@ print('   bounded in', $elapsed, 's:', payload['feeds'][0]['error'])
 "
 [ "$elapsed" -lt 20 ] || { echo "   took too long: ${elapsed}s"; exit 1; }
 
+echo "== CPU budget grows with feed size, a tiny runaway feed stays near the base"
+python3 -c "
+import importlib.machinery, importlib.util
+loader = importlib.machinery.SourceFileLoader('sync', '$root/bin/protoncal-sync')
+sync = importlib.util.module_from_spec(importlib.util.spec_from_loader('sync', loader))
+loader.exec_module(sync)
+hostile = sync.expansion_cpu_limit(open('hostile.ics').read())
+large = sync.expansion_cpu_limit('x' * (1536 * 1024))
+huge = sync.expansion_cpu_limit('x' * sync.MAX_FEED_BYTES)
+assert hostile == sync.EXPANSION_CPU_BASE_SEC + 1, hostile
+assert large == sync.EXPANSION_CPU_BASE_SEC + 15, large
+assert huge == sync.EXPANSION_CPU_MAX_SEC, huge
+print('   hostile.ics:', hostile, 's  1.5 MiB:', large, 's  32 MiB:', huge, 's')
+"
+
 echo "== unsupported URL scheme is rejected"
 printf '[{"name": "", "url": "file://%s/fixture.ics"}]\n' "$PWD" > "$work/local-feeds.json"
 "$root/bin/protoncal-sync" --feeds "$work/local-feeds.json" > "$work/local-payload.json"
